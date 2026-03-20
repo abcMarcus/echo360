@@ -114,7 +114,7 @@ class EchoCourse(object):
                 self.video_url,
                 self._driver.page_source,
             )
-            json_str = self.driver.find_element_by_tag_name("pre").text
+            json_str = self.driver.find_element(By.TAG_NAME, "pre").text
         except ValueError as e:
             raise Exception("Unable to retrieve JSON (course_data) from url", e)
         self.course_data = json.loads(json_str)
@@ -157,25 +157,19 @@ class EchoCloudCourse(EchoCourse):
         return self._videos
 
     @property
+    def url(self):
+        if not self._uuid or self._uuid == "NONE":
+            return self._hostname
+        return "{}/section/{}/home".format(self._hostname, self._uuid)
+
+    @property
     def video_url(self):
         return "{}/section/{}/syllabus".format(self._hostname, self._uuid)
 
     @property
     def course_id(self):
         if self._course_id is None:
-            # self.course_data['data'][0]['lesson']['lesson']['displayName']
-            # should be in the format of XXXXX (ABCD1001 - 2020 - Semester 1) ???
-            # canidate = self.course_data['data'][0]['lesson']['video']['published']['courseName']
-            # print(self._course_name)
-            # self._course_name = canidate
-            # Too much variant, it's too hard to have a unique way to extract course id.
-            # we will simply use course name and ignore any course id.
             self._course_id = ""
-            # result = re.search('^[^(]+', canidate)
-            # if result is not None:
-            #     self._course_name = result.group()
-            #     result = re.search('[(].+[)]', canidate)
-            #     self._course_id = result.group()[1:-1]
         return self._course_id
 
     @property
@@ -184,23 +178,17 @@ class EchoCloudCourse(EchoCourse):
         cookies = {
             cookie["name"]: cookie["value"] for cookie in self._driver.get_cookies()
         }
-        response = requests.get(
-            "https://echo360.net.au/user/enrollments", cookies=cookies
-        )
+        enrollment_url = "{}/user/enrollments".format(self._hostname)
+        response = requests.get(enrollment_url, cookies=cookies)
         if response.status_code == 200:
-            course_list = response.json()["data"]
-            for sections_parts in course_list:
-                matching = [
-                    x
-                    for x in sections_parts["userSections"]
-                    if x["sectionId"] == self._uuid
-                ]
-                if len(matching) > 0:
-                    course = matching[0]
-                    return strip_illegal_path(
-                        f"{course['courseCode']} - {course['sectionName']} {course['courseName']}"
-                    )
-
+            data = response.json().get("data", [])
+            target_uuid = self._uuid.strip().lower()
+            for group in data:
+                for section in group.get("userSections", []):
+                    if str(section.get("sectionId")).strip().lower() == target_uuid:
+                        return strip_illegal_path(
+                            f"{section['courseCode']} - {section['sectionName']} {section['courseName']}"
+                        )
         return "[[UNTITLED]]"
 
     @property

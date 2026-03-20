@@ -62,3 +62,4 @@ _browser_user_data_dir/
 
 .vscode/
 _browser_persistent_session/
+session_cookies.json

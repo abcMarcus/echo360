@@ -40,6 +40,8 @@ def handle_args():
     parser = argparse.ArgumentParser(description="Download lectures from  portal.")
     parser.add_argument(
         "url",
+        nargs="?",
+        default=None,
         help="Full URL of the echo360 course page, \
               or only the UUID (which defaults to USYD). \
               The URL of the course's video lecture page, \
@@ -226,16 +228,21 @@ def handle_args():
     username = args["unikey"]
     password = args["password"]
     # check if the given uuid is actually a full URL
-    course_hostname = re.search(
-        "https?:[/]{2}[^/]*", course_url
-    )  # would be none if it does not exists
-    if course_hostname is not None:
-        course_hostname = course_hostname.group()
+    if course_url:
+        course_hostname = re.search(
+            "https?:[/]{2}[^/]*", course_url
+        )  # would be none if it does not exists
+        if course_hostname is not None:
+            course_hostname = course_hostname.group()
+        else:
+            _LOGGER.info(
+                "Non-URL value is given, defaults to University of Sydney's echo system"
+            )
+            _LOGGER.info("Use the full URL if you want to use this in other University")
     else:
-        _LOGGER.info(
-            "Non-URL value is given, defaults to University of Sydney's echo system"
-        )
-        _LOGGER.info("Use the full URL if you want to use this in other University")
+        # Default for interactive mode if no URL is given
+        course_hostname = "https://echo360.net.au"
+        _LOGGER.info("No URL provided, entering interactive course selection mode.")
 
     args_without_sensitive_info = dict(args)
     args_without_sensitive_info.pop("unikey", None)
@@ -364,7 +371,12 @@ def main():
         start_download_binary(binary_downloader, binary_type, manual=True)
         exit(0)
 
-    if usingEcho360Cloud:
+    # Use a placeholder course for login if no URL is given
+    if not course_url:
+        course = EchoCloudCourse(
+            "NONE", course_hostname, alternative_feeds, subtitles=subtitles
+        )
+    elif usingEcho360Cloud:
         # echo360 cloud
         course_uuid = re.search(
             "[^/]([0-9a-zA-Z]+[-])+[0-9a-zA-Z]+", course_url
@@ -401,18 +413,38 @@ def main():
             binary_type, "LOCAL" if use_local_binary else "GLOBAL"
         )
     )
-    if setup_credential:
+
+    # 1. Login/Establish session
+    if not setup_credential:
+        downloader.login()
+    else:
         run_setup_credential(
             downloader._driver, course_hostname, echo360_cloud=True, manual=manual
         )
-        try:
-            downloader._driver.set_window_size(0, 0)
-            raise selenium.common.exceptions.InvalidArgumentException()
-        except selenium.common.exceptions.InvalidArgumentException:
-            # fallback to default size
-            # see https://github.com/soraxas/echo360/issues/50
-            downloader._driver.set_window_size(800, 600)
-    downloader.download_all()
+        # Re-save session data after manual login
+        downloader._save_cookies()
+
+    # 2. Select courses if in interactive mode
+    if not course_url:
+        selected_uuids = downloader.select_courses()
+        if not selected_uuids:
+            print("No courses selected. Exiting.")
+            downloader._driver.close()
+            return
+
+        for uuid in selected_uuids:
+            print(f"\nProcessing course UUID: {uuid}")
+            # Create a new course object for this specific section
+            new_course = EchoCloudCourse(
+                uuid, course_hostname, alternative_feeds, subtitles=subtitles
+            )
+            new_course.set_driver(downloader._driver)
+            downloader._course = new_course
+            # For each course, we must visit its home page to switch roles
+            downloader.download_all()
+    else:
+        # Single course mode
+        downloader.download_all()
 
 
 def start_download_binary(binary_downloader, binary_type, manual=False):

@@ -89,8 +89,8 @@ class EchoVideo(object):
                     EC.presence_of_element_located((By.ID, "content-player"))
                 )
                 return (
-                    self._driver.find_element_by_id("content-player")
-                    .find_element_by_tag_name("video")
+                    self._driver.find_element(By.ID, "content-player")
+                    .find_element(By.TAG_NAME, "video")
                     .get_attribute("src")
                 )
             except selenium.common.exceptions.TimeoutException:
@@ -504,12 +504,16 @@ class EchoCloudVideo(EchoVideo):
                 self._driver.get(video_url)
                 try:
                     # the replace is for reversing the escape by the escapped js in the page source
-                    urls = set(
+                    all_urls = set(
                         re.findall(
                             'https://[^,"]*?[.]{}'.format(suffix),
-                            self._driver.page_source.replace("\/", "/"),
+                            self._driver.page_source.replace("\\/", "/"),
                         )
                     )
+                    # Usyd now plays this annoying intro video:
+                    # https://branding.echo360.net.au/3ecd8fbd-9a28-45d5-82bd-e9775e3b5db1/videos/intros/3686b85b-e70d-49e9-9d22-cc61e52aef64/Intro-640x360.mp4
+                    # will filter it out
+                    urls = {u for u in all_urls if "/intros/" not in u.lower() and "intro-" not in u.lower()}
                     return urls
 
                 except selenium.common.exceptions.TimeoutException:

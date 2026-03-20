@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 import re
+import time
 
 from .course import EchoCloudCourse
 from .echo_exceptions import EchoLoginError
@@ -14,6 +15,7 @@ import pip_ensure_version
 from pick import pick
 import selenium
 from selenium import webdriver
+from selenium.webdriver.common.by import By
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 import selenium.common.exceptions as seleniumException
 import warnings  # hide the warnings of phantomjs being deprecated
@@ -36,7 +38,7 @@ def build_stealth_driver(
 
     kwargs = dict()
     if persistent_session:
-        kwargs["user_data_dir"] = PERSISTENT_SESSION_FOLDER
+        kwargs["user_data_dir"] = os.path.abspath(PERSISTENT_SESSION_FOLDER)
         print(
             ">> Warning: persistent session *might* not supported by stealth. If it has issue, try to delete '{}' folder.".format(
                 PERSISTENT_SESSION_FOLDER
@@ -48,6 +50,8 @@ def build_stealth_driver(
     opts = Options()
     opts.add_argument("--window-size=1920x1080")
     opts.add_argument("user-agent={}".format(user_agent))
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
 
     if not selenium_version_ge_4100:
         print(">> This version of selenium might not be supported by stealth")
@@ -71,10 +75,12 @@ def build_chrome_driver(
     if not setup_credential:
         opts.add_argument("--headless")
     if persistent_session:
-        folder_path = PERSISTENT_SESSION_FOLDER  # default current dir
+        folder_path = os.path.abspath(PERSISTENT_SESSION_FOLDER)  # use absolute path
         opts.add_argument("--user-data-dir={}".format(folder_path))
     opts.add_argument("--window-size=1920x1080")
     opts.add_argument("user-agent={}".format(user_agent))
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
 
     kwargs = dict()
     if selenium_version_ge_4100:
@@ -210,6 +216,7 @@ class EchoDownloader(object):
 
         # define a log path for phantomjs to output, to prevent hanging due to PIPE being full
         log_path = os.path.join(root_path, "webdriver_service.log")
+        self._cookie_path = os.path.join(root_path, "session_cookies.json")
 
         self._useragent = "Mozilla/5.0 (iPad; CPU OS 6_0 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) Version/6.0 Mobile/10A5376e Safari/8536.25"
         # self._driver = webdriver.PhantomJS()
@@ -254,11 +261,15 @@ class EchoDownloader(object):
 
     def login(self):
         # Initialize to establish the 'anon' cookie that Echo360 sends.
+        self._driver.get(self._course.hostname)
+        self._load_cookies()
         self._driver.get(self._course.url)
         # First see if we have successfully access course page without the need to login
         # for example: https://view.streaming.sydney.edu.au:8443/ess/portal/section/ed9b26eb-a785-4f4e-bd51-69f3faab388a
-        if self.find_element_by_partial_id("username") is not None:
+        username_el = self.find_element_by_partial_id("username")
+        if username_el is not None:
             self.loginWithCredentials()
+            self._save_cookies()
         else:
             # check if it is network error
             if "<html><head></head><body></body></html>" in self._driver.page_source:
@@ -286,10 +297,78 @@ class EchoDownloader(object):
                     self._course.url,
                     self._driver.page_source,
                 )
+                self._save_cookies()
         if not isinstance(self._course, EchoCloudCourse):
             # for canvas echo360
             self.retrieve_real_uuid()
         print("Done!")
+
+    def _save_cookies(self):
+        try:
+            cookies = self._driver.get_cookies()
+            # Capture LocalStorage and SessionStorage as well
+            local_storage = self._driver.execute_script(
+                "var ls = window.localStorage, items = {}; "
+                "for (var i = 0, k; i < ls.length; ++i) "
+                "  items[k = ls.key(i)] = ls.getItem(k); "
+                "return items; "
+            )
+            session_storage = self._driver.execute_script(
+                "var ss = window.sessionStorage, items = {}; "
+                "for (var i = 0, k; i < ss.length; ++i) "
+                "  items[k = ss.key(i)] = ss.getItem(k); "
+                "return items; "
+            )
+            data = {
+                "cookies": cookies,
+                "local_storage": local_storage,
+                "session_storage": session_storage
+            }
+            with open(self._cookie_path, "w") as f:
+                json.dump(data, f)
+            _LOGGER.debug("Saved session data to %s", self._cookie_path)
+            print(f"  > DEBUG: Saved session data ({len(cookies)} cookies).")
+        except Exception as e:
+            _LOGGER.error("Failed to save session data: %s", e)
+
+    def _load_cookies(self):
+        if not os.path.exists(self._cookie_path):
+            print("  > DEBUG: No session_cookies.json found.")
+            return
+        try:
+            with open(self._cookie_path, "r") as f:
+                data = json.load(f)
+
+            if isinstance(data, list):
+                cookies = data
+                local_storage = {}
+                session_storage = {}
+            else:
+                cookies = data.get("cookies", [])
+                local_storage = data.get("local_storage", {})
+                session_storage = data.get("session_storage", {})
+
+            for cookie in cookies:
+                # Selenium might complain about 'expiry' if it's not an int or if it's too old
+                if "expiry" in cookie:
+                    cookie["expiry"] = int(cookie["expiry"])
+                try:
+                    self._driver.add_cookie(cookie)
+                except Exception as e:
+                    # This is common if the domain doesn't match the current page
+                    _LOGGER.debug("Failed to add cookie %s: %s", cookie.get("name"), e)
+
+            # Restore LocalStorage
+            for k, v in local_storage.items():
+                self._driver.execute_script(f"window.localStorage.setItem({json.dumps(k)}, {json.dumps(v)});")
+
+            # Restore SessionStorage
+            for k, v in session_storage.items():
+                self._driver.execute_script(f"window.sessionStorage.setItem({json.dumps(k)}, {json.dumps(v)});")
+
+            print(f"INFO: Loaded existing session data ({len(cookies)} cookies).")
+        except Exception as e:
+            _LOGGER.error("Failed to load session data: %s", e)
 
     def loginWithCredentials(self):
         _LOGGER.debug("Logging in with credentials")
@@ -320,7 +399,7 @@ class EchoDownloader(object):
         user_passwd.send_keys(self._password)
 
         try:
-            login_btn = self._driver.find_element_by_id("login-btn")
+            login_btn = self._driver.find_element(By.ID, "login-btn")
             login_btn.submit()
         except seleniumException.NoSuchElementException:
             # try submit via enter key
@@ -334,12 +413,116 @@ class EchoDownloader(object):
             print("  > Failed to login, is your username/password correct...?")
             raise EchoLoginError(self._driver)
 
+    def select_courses(self):
+        # 1. Ask for role first
+        role_options = ["Student", "Instructor", "TeachingAssistant"]
+        title = "Select your Echo360 role:"
+        role, _ = pick(role_options, title)
+
+        # 2. Switch role using Selenium (browser context)
+        print(f"  > Switching role to {role} via browser...")
+        try:
+            # Use JS to perform the POST request within the browser
+            # This ensures all session state (including CSRF tokens) is handled by the browser
+            script = f"""
+                var form = new FormData();
+                form.append('role', '{role}');
+                form.append('action', 'Save');
+                return fetch('/changeRole', {{
+                    method: 'POST',
+                    body: form
+                }}).then(res => res.ok);
+            """
+            success = self._driver.execute_script(script)
+            if not success:
+                print(f"  > Warning: Role switch POST returned non-OK status.")
+
+            # Wait a moment for the role change to process
+            time.sleep(2)
+        except Exception as e:
+            print(f"  > Error switching role via browser: {e}")
+
+        # 3. Fetch enrollments using Selenium
+        enrollment_url = "{}/user/enrollments".format(self._course.hostname)
+        print(f"  > Fetching enrollments from {enrollment_url}...")
+        self._driver.get(enrollment_url)
+        try:
+            import json
+            # Grab the JSON content from the page (Selenium usually wraps JSON in <pre> tags)
+            try:
+                json_text = self._driver.find_element(By.TAG_NAME, "pre").text
+            except:
+                # Fallback to body text if <pre> isn't found
+                json_text = self._driver.find_element(By.TAG_NAME, "body").text
+            data = json.loads(json_text).get("data", [])
+            # Save the session data now that we have successfully fetched enrollments
+            self._save_cookies()
+        except Exception as e:
+            print(f"  > Error fetching enrollments via browser: {e}")
+            _LOGGER.debug("Page source: %s", self._driver.page_source)
+            return []
+
+        if not data:
+            print("No courses found in your account.")
+            return []
+
+        # Use the first group that has sections
+        group_to_use = None
+        for group in data:
+            if group.get("userSections"):
+                group_to_use = group
+                break
+
+        if not group_to_use:
+            print("No courses found in any enrollment group.")
+            return []
+
+        user_sections = group_to_use.get("userSections", [])
+
+        # 4. Interactive selection using fzf if available, else pick
+        course_options = [
+            f"{s['courseCode']} - {s['sectionName']} {s['courseName']}"
+            for s in user_sections
+        ]
+
+        try:
+            import subprocess
+            # Use fzf for fuzzy searching and multi-selection
+            fzf_input = "\n".join(course_options).encode('utf-8')
+            # -m for multi-select, --cycle for easier navigation
+            process = subprocess.Popen(
+                ['fzf', '-m', '--cycle', '--header=Select course(s) (TAB to mark, ENTER to finish):'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None
+            )
+            stdout, _ = process.communicate(input=fzf_input)
+            selected_lines = stdout.decode('utf-8').splitlines()
+
+            if not selected_lines:
+                return []
+
+            selected_uuids = []
+            for line in selected_lines:
+                # Match the line back to the section index
+                idx = course_options.index(line)
+                selected_uuids.append(user_sections[idx]["sectionId"])
+
+            return selected_uuids
+
+        except (ImportError, FileNotFoundError, subprocess.CalledProcessError):
+            # Fallback to pick if fzf is not found or fails
+            title = "Select course(s) to download (SPACE to mark, ENTER to continue):"
+            selected = pick(course_options, title, multiselect=True, min_selection_count=1)
+            return [user_sections[s[1]]["sectionId"] for s in selected]
+
     def download_all(self):
         if self.setup_credential:
             sys.stdout.write(
                 ">> I'm gonna assume you are responsible enough to had "
                 "finished logged in by now ;)\n"
             )
+            self._driver.get(self._course.url)
         else:
             sys.stdout.write('>> Logging into "{0}"... '.format(self._course.url))
             sys.stdout.flush()
@@ -347,18 +530,20 @@ class EchoDownloader(object):
         sys.stdout.write(">> Retrieving echo360 Course Info... ")
         sys.stdout.flush()
 
-        # change the output directory to be inside a folder named after the course
-        # replace invalid character for folder
+        # Use a local variable for the course output directory to avoid nesting
+        # when downloading multiple courses in interactive mode.
+        course_output_dir = self._output_dir
         if isinstance(self._course, EchoCloudCourse):
-            self._output_dir = os.path.join(
+            course_output_dir = os.path.join(
                 self._output_dir,
                 "{0}".format(self._course.nice_name).strip(),
             )
-        if self._output_dir and not os.path.isdir(self._output_dir):
-            os.makedirs(self._output_dir)
+        if course_output_dir and not os.path.isdir(course_output_dir):
+            os.makedirs(course_output_dir)
+        
         if self._dump_json:
             dump_json_path = os.path.join(
-                self._output_dir,
+                course_output_dir,
                 f"course_{datetime.now().replace(microsecond=0).isoformat().replace(':','_')}.json",
             )
             with open(dump_json_path, "w") as f:
@@ -415,10 +600,9 @@ class EchoDownloader(object):
                     "not contain any video.".format(filename)
                 )
             else:
-                if video.download(self._output_dir, filename):
+                if video.download(course_output_dir, filename):
                     downloaded_videos.insert(0, filename)
         print(self.success_msg(self._course.course_name, downloaded_videos))
-        self._driver.close()
 
     @property
     def useragent(self):
@@ -461,8 +645,8 @@ class EchoDownloader(object):
 
     def find_element_by_partial_id(self, id):
         try:
-            return self._driver.find_element_by_xpath(
-                "//*[contains(@id,'{0}')]".format(id)
+            return self._driver.find_element(
+                By.XPATH, "//*[contains(@id,'{0}')]".format(id)
             )
         except seleniumException.NoSuchElementException:
             return None
