@@ -168,7 +168,7 @@ def handle_args():
         "--subtitles",
         "-s",
         action="store_true",
-        default=False,
+        default=True,
         dest="subtitles",
         help="Download VTT subtitles for each video feed.",
     )
